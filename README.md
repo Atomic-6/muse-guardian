@@ -5,7 +5,7 @@
 ## 使用
 
 ```
-帮我安装 `https://raw.githubusercontent.com/bytehola/muse-guardian/refs/heads/main/SKILL.md`并开始执行。
+帮我安装 `https://raw.githubusercontent.com/Atomic-6/muse-guardian/refs/heads/main/SKILL.md`并开始执行。
 ```
 
 如遇拦截，打开侧边栏点击新旁路会话发送。
