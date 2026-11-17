@@ -2130,13 +2130,15 @@ touch /home/hatch/hooks/definitions/.write-test && rm -f /home/hatch/hooks/defin
 #!/usr/bin/env bash
 # keepalive-tripwire.sh — 沙盒保活轻量探针（hook polling script）。
 #
-# 设计目标：把"检测"和"恢复"拆开。检测只跑一条 shell（health-check.sh），
-# 不启动 LLM worker；健康时 silent，本轮零 token；只在真正需要恢复、
-# 或持续失联时 wake，让完整 worker 来处理。
+# 设计目标：检测、恢复、上报三段全部用 bash 完成，**重建恢复零 token**。
+#   - 检测：health-check.sh（一条 shell）
+#   - 恢复：自己跑 restore-all.sh（幂等 + 自带原子锁），不唤醒 LLM worker
+#   - 上报：自愈成功静默；只有自己修不好才 wake，让 AI 介入
 #
 # 退出码契约（health-check.sh 实际只返回 0/1）：
 # - 退出码 0 → silent "healthy"（健康，零 token，清零计数）
-# - 退出码 1 → 立即 wake "restore_needed"（检查已跑出确定性结论，无防抖）
+# - 退出码 1 → 自己跑 restore-all.sh（零 token）：修好则 silent "self_healed"；
+#              修不好才 wake "restore_failed"（唯一花 token 的路径）
 # - 退出码非 0/1（脚本缺失、exec 通道异常等）→ 累计，连续 3 次后 wake "unreachable"
 #   （检查没跑起来、立即态未知，防抖窗口约 30 秒）
 # 连续失败计数记在 ~/hooks/state/（$HOME 持久化，沙盒重建不丢）。
@@ -2180,9 +2182,32 @@ if [ "$rc" -eq 0 ]; then
   echo '{"consec_fail":0}' >"$STATE_FILE"
   silent "healthy" '{"exit_code":0}'
 elif [ "$rc" -eq 1 ]; then
-  # 需要恢复（检查已跑出确定性结论：疑似重建或关键服务挂了）：立即唤醒，无防抖
+  # 需要恢复（疑似重建或关键服务挂了）：先自己跑恢复脚本，纯 bash，零 token
   echo '{"consec_fail":0}' >"$STATE_FILE"
-  wake "restore_needed" "$(build_payload 1 0 "$detail")"
+  RESTORE="$HOME/workspace/setup/restore-all.sh"
+  if [ -d "$HOME/workspace/setup/.restore.lock" ]; then
+    # 上一轮还在恢复，restore 自带原子锁，这里直接跳过省一次进程
+    silent "restore_running" "$(build_payload 1 0 "restore already in progress")"
+  elif [ ! -f "$RESTORE" ]; then
+    # 连恢复脚本都不在（HOME 异常等），这种只能交给 AI 判断
+    wake "restore_needed" "$(build_payload 1 0 "$detail")"
+  else
+    log "self_heal_start" "$(build_payload 1 0 "$detail")"
+    set +e
+    timeout 420 bash "$RESTORE" >>"$HOME/workspace/setup/logs/restore.log" 2>&1
+    restore_rc=$?
+    detail2="$("$HEALTH_CHECK" 2>&1)"
+    rc2=$?
+    set -e
+    if [ "$rc2" -eq 0 ]; then
+      # 自愈成功：零 token、不打扰（证据在 restore.log 与 hook jsonl）
+      log "self_heal_ok" "{\"restore_rc\":$restore_rc,\"health\":0}"
+      silent "self_healed" "$(build_payload 0 0 "restore rc=$restore_rc")"
+    else
+      # 自己修不好才唤醒 AI —— 这是唯一消耗 token 的路径
+      wake "restore_failed" "$(build_payload "$rc2" 0 "restore rc=$restore_rc; $detail2")"
+    fi
+  fi
 else
   # rc 非 0/1（检查本身没跑起来：脚本缺失、exec 通道异常等）：累计，连续 3 次才唤醒，
   # 避免单次抖动误唤醒一个 worker（10 秒周期下防抖窗口约 30 秒）
@@ -2221,7 +2246,7 @@ bash -n ~/hooks/scripts/keepalive-tripwire.sh && echo "语法 OK"
   "enabled": false,
   "delivery": { "surface": "main" },
   "presentation_locale": "zh-CN",
-  "prompt": "你是沙盒保活的恢复执行员。hook 的轻量 bash 探针每 10 秒跑一次健康检查，平时它自己静默（零 token）；只在真出事时才把你叫醒，所以你每次被叫醒都要认真对待。\n\nwake 事件自带 reason 和 payload：\n- reason=restore_needed：health-check.sh 返回 1，疑似沙盒被重建，或 cf-probe / hermes 微信网关 / sshd / cron 关键服务挂了。\n- reason=unreachable：health-check.sh 连续 3 次无法执行或返回非 0/1（检查没跑起来），沙盒可能正在重建或 exec 通道异常。\n\n你的步骤：\n1. 先重跑 `bash ~/workspace/setup/health-check.sh` 确认当前状态（事件发生和你醒来之间情况可能已变）。\n2. 退出码 0：说明已恢复或为误报，直接结束。不要发消息，不要写日志。\n3. 退出码 1：后台执行 `bash ~/workspace/setup/restore-all.sh` 并等待完成（约 2 分钟，最多等 15 分钟；该脚本幂等，可安全重跑）。完成后重跑 `health-check.sh` 验证。只在异常/恢复时记日志：把\"检测到什么、是否恢复成功、各服务当前状态\"追加到当天 `~/memory/YYYY-MM-DD.md`。恢复成功后在当前聊天给用户发一条简短中文通知；恢复失败则告诉用户失败了、最后看到的错误是什么（看 `~/workspace/setup/logs/restore.log` 尾部），请用户指示下一步，不要反复重试。\n4. 退出码非 0/1 或 exec 不通：探针已经连续 3 次失败才叫醒你，重试一次 `health-check.sh`；仍不通则在当前聊天简短告诉用户沙盒可能失联、请指示下一步。\n\n铁律：\n- 绝不在任何消息、日志正文或回复中复述探针 API_SECRET（它在 `~/workspace/setup/install-cf-probe.sh`，600 权限）。\n- 不要编辑 `~/MEMORY.md`。\n- 只有\"触发了恢复\"或\"持续失联\"才打扰用户。"
+  "prompt": "你是沙盒保活的恢复执行员。hook 的轻量 bash 探针每 10 秒跑一次健康检查，平时它自己静默（零 token）；只在真出事时才把你叫醒，所以你每次被叫醒都要认真对待。\n\nwake 事件自带 reason 和 payload：\n- reason=restore_needed：health-check.sh 返回 1，疑似沙盒被重建，或 cf-probe / hermes 微信网关 / sshd / cron 关键服务挂了。\n- reason=restore_failed：探针自己跑过 restore-all.sh 但复检仍不健康，需要你接手排查（这是最主要的唤醒原因）。\n- reason=unreachable：health-check.sh 连续 3 次无法执行或返回非 0/1（检查没跑起来），沙盒可能正在重建或 exec 通道异常。\n\n你的步骤：\n1. 先重跑 `bash ~/workspace/setup/health-check.sh` 确认当前状态（事件发生和你醒来之间情况可能已变）。\n2. 退出码 0：说明已恢复或为误报，直接结束。不要发消息，不要写日志。\n3. 退出码 1：后台执行 `bash ~/workspace/setup/restore-all.sh` 并等待完成（约 2 分钟，最多等 15 分钟；该脚本幂等，可安全重跑）。完成后重跑 `health-check.sh` 验证。只在异常/恢复时记日志：把\"检测到什么、是否恢复成功、各服务当前状态\"追加到当天 `~/memory/YYYY-MM-DD.md`。恢复成功时不要发任何消息（探针已自行完成恢复，日志在 `~/workspace/setup/logs/restore.log`）；只有 reason=restore_failed（探针自己修不好）或持久失联时才在当前聊天通知用户，说明检测到什么、最后看到的错误是什么、请用户指示下一步，不要反复重试。\n4. 退出码非 0/1 或 exec 不通：探针已经连续 3 次失败才叫醒你，重试一次 `health-check.sh`；仍不通则在当前聊天简短告诉用户沙盒可能失联、请指示下一步。\n\n铁律：\n- 绝不在任何消息、日志正文或回复中复述探针 API_SECRET（它在 `~/workspace/setup/install-cf-probe.sh`，600 权限）。\n- 不要编辑 `~/MEMORY.md`。\n- 只有\"触发了恢复\"或\"持续失联\"才打扰用户。"
 }
 ```
 
@@ -2232,7 +2257,7 @@ bash -n ~/hooks/scripts/keepalive-tripwire.sh && echo "语法 OK"
 > ⏰ 现在设第二层：平台 hook 探针。它跑在沙盒外面，每 10 秒检查一次——**沙盒被重建它也不会死**。
 >
 > 跟旧版每分钟启动一个 AI 做巡检不同，这个探针平时只跑一段 shell，健康时零 token 消耗；
-> 检查返回 1（重建或服务挂掉）它**立即**唤醒 AI 跑恢复；只有检查本身没跑起来才需连续 3 次确认（约 30 秒）。恢复约 2 分钟，成功后才通知你；健康的时候完全静默，不打扰你。
+> 检查返回 1（重建或服务挂掉）它**立即**唤醒 AI 跑恢复；只有检查本身没跑起来才需连续 3 次确认（约 30 秒）。恢复约 2 分钟，而且**由探针自己跑脚本完成**（不唤醒 AI、不花 token），成功不打扰你；只有它自己修不好时才叫 AI 来找你。健康的时候完全静默。
 > 你这边只要确认 hook 注册上了就行，我继续。
 
 ### ③ 🙋 用户手动做
